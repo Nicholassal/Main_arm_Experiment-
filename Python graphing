@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+
+import serial
+import time
+import csv
+import matplotlib.pyplot as plt
+
+# --------------------- User Configuration ---------------------
+SERIAL_PORT = "COM3"        # Update with your Arduino port
+BAUD_RATE   = 115200
+CSV_FILENAME = "gearbox_experiment_data.csv"
+
+# --------------------- Initialize Plots -----------------------
+plt.ion()  # Interactive mode on
+fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+fig.suptitle("Real-Time Gearbox Efficiency Experiment")
+
+# Subplots:
+# axs[0] -> Torque vs Gearbox RPM
+# axs[1] -> Efficiency vs Gearbox RPM
+# axs[2] -> Power in vs Power out
+
+# Data arrays
+motor_rpm_data      = []
+gearbox_rpm_data    = []
+force_data          = []
+torque_data         = []
+input_power_data    = []
+output_power_data   = []
+efficiency_data     = []
+
+# For logging
+csv_file = open(CSV_FILENAME, mode='w', newline='')
+csv_writer = csv.writer(csv_file)
+# Write header
+csv_writer.writerow(["MotorRPM", "GearboxRPM", "Force(N)", "Torque(Nm)", 
+                     "InputPower(W)", "OutputPower(W)", "Efficiency(%)"])
+
+# --------------------- Open Serial Port -----------------------
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+time.sleep(2)  # Give Arduino time to reset
+
+print("Connected to:", SERIAL_PORT)
+print("Logging data to:", CSV_FILENAME)
+
+# --------------------- Real-Time Read Loop ---------------------
+try:
+    while True:
+        line = ser.readline().decode('utf-8').strip()
+        if not line:
+            continue
+        # Expect CSV format: MotorRPM, GearboxRPM, Force(N), Torque(Nm), InputPower(W), OutputPower(W), Efficiency(%)
+        parts = line.split(',')
+        if len(parts) < 7:
+            continue  # skip if malformed
+
+        try:
+            motor_rpm      = float(parts[0])
+            gearbox_rpm    = float(parts[1])
+            force_n        = float(parts[2])
+            torque_nm      = float(parts[3])
+            input_power_w  = float(parts[4])
+            output_power_w = float(parts[5])
+            efficiency_pct = float(parts[6])
+        except ValueError:
+            continue  # skip if conversion error
+
+        # Append to arrays
+        motor_rpm_data.append(motor_rpm)
+        gearbox_rpm_data.append(gearbox_rpm)
+        force_data.append(force_n)
+        torque_data.append(torque_nm)
+        input_power_data.append(input_power_w)
+        output_power_data.append(output_power_w)
+        efficiency_data.append(efficiency_pct)
+
+        # Write to CSV
+        csv_writer.writerow([motor_rpm, gearbox_rpm, force_n, torque_nm, 
+                             input_power_w, output_power_w, efficiency_pct])
+        csv_file.flush()
+
+        # --------------------- Update Plots Periodically ---------------------
+        # For performance, update graphs every ~1 second (or every N lines)
+        if len(motor_rpm_data) % 10 == 0:
+            # Clear old data
+            axs[0].clear()
+            axs[1].clear()
+            axs[2].clear()
+
+            # Plot Torque vs Gearbox RPM
+            axs[0].plot(gearbox_rpm_data, torque_data, 'b.-')
+            axs[0].set_xlabel("Gearbox RPM")
+            axs[0].set_ylabel("Torque (Nm)")
+            axs[0].set_title("Torque vs Gearbox RPM")
+            axs[0].grid(True)
+
+            # Plot Efficiency vs Gearbox RPM
+            axs[1].plot(gearbox_rpm_data, efficiency_data, 'r.-')
+            axs[1].set_xlabel("Gearbox RPM")
+            axs[1].set_ylabel("Efficiency (%)")
+            axs[1].set_title("Efficiency vs Gearbox RPM")
+            axs[1].grid(True)
+            axs[1].set_ylim([0, 100])  # Adjust if you expect >100%
+
+            # Plot Power (Input vs Output)
+            axs[2].plot(gearbox_rpm_data, input_power_data, 'g.-', label='Input Power')
+            axs[2].plot(gearbox_rpm_data, output_power_data, 'm.-', label='Output Power')
+            axs[2].set_xlabel("Gearbox RPM")
+            axs[2].set_ylabel("Power (W)")
+            axs[2].set_title("Power In vs. Power Out")
+            axs[2].legend()
+            axs[2].grid(True)
+
+            plt.tight_layout()
+            plt.pause(0.01)  # brief pause to allow the plot to update
+
+except KeyboardInterrupt:
+    print("Interrupted by user.")
+
+finally:
+    # Close everything properly
+    ser.close()
+    csv_file.close()
+    # Save the final figure
+    fig.savefig("gearbox_experiment_plots.png")
+    print("Data saved to CSV and final plot saved to PNG.")
