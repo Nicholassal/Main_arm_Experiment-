@@ -1,0 +1,176 @@
+/*************************************************************
+ * Arduino Sketch for Real-Time Gearbox Efficiency Experiment
+ * 
+ * Hardware Components:
+ *   - NEMA 34 stepper motor
+ *   - HSS86 closed-loop stepper driver
+ *   - HX711 load cell amplifier
+ *   - INA219 current/voltage sensor
+ *   - Arduino-compatible microcontroller (e.g. Mega/Uno)
+ *
+ * Wiring (example):
+ *   - HSS86:
+ *       PUL+ -> Arduino pin 2
+ *       PUL- -> GND
+ *       DIR+ -> Arduino pin 3
+ *       DIR- -> GND
+ *       ENA+ -> Arduino pin 4 (optional for enable)
+ *       ENA- -> GND
+ *   - HX711:
+ *       VCC -> 5V
+ *       GND -> GND
+ *       DT  -> Arduino pin A1
+ *       SCK -> Arduino pin A0
+ *   - INA219:
+ *       SDA -> Arduino SDA
+ *       SCL -> Arduino SCL
+ *       Vin+ / Vin- in series with motor supply or driver input
+ *
+ * Serial Protocol:
+ *   - Receives an integer RPM (100 to 1200)
+ *   - Outputs CSV lines of measured data
+ *************************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include "HX711.h"
+
+// ------------------------- Pin Definitions -------------------------
+const int PIN_PUL = 2;     // Pulse pin to HSS86
+const int PIN_DIR = 3;     // Direction pin to HSS86
+const int PIN_ENA = 4;     // Enable pin to HSS86 (optional)
+const int HX711_DT = A1;   // HX711 data pin
+const int HX711_SCK = A0;  // HX711 clock pin
+
+// ------------------------- Constants & Calibration -------------------------
+const float GEARBOX_RATIO       = 15.0;    // 15:1
+const float ARM_RADIUS_METERS   = 0.4;     // 400 mm = 0.4 m
+const float GRAVITY             = 9.81;    // m/s^2
+const long STEPS_PER_REV        = 200;     // Basic steps for the stepper motor (1.8°/step)
+const float MICROSTEPPING       = 1.0;     // e.g. 1, 4, 8, 16, etc., depending on driver DIP or software setting
+
+// HX711 calibration factor: adjust this to get accurate force readings
+// Typically derived from known weights on the load cell.
+float hx711_calibration_factor  = 2280.0f;
+
+// Motor control timing
+// The step frequency = (Motor_RPM * STEPS_PER_REV * MICROSTEPPING) / 60
+// The pulse period (in microseconds) = 1e6 / step_frequency
+// E.g. at 100 RPM, step frequency = (100 * 200) / 60 = ~333 pulses/s => ~3000us per pulse
+// We'll recalc in loop based on user RPM.
+long pulseDelayMicros = 3000; // default for ~100 RPM
+
+// ------------------------- Global Objects -------------------------
+HX711 scale;                   // HX711 load cell interface
+Adafruit_INA219 ina219;        // INA219 sensor
+
+// Variables updated each loop
+float motorRPM        = 100;   // default motor speed
+bool  newCommand      = false; // indicates new RPM received
+bool  motorEnabled    = true;  // set to false if you want to disable driver
+
+// ------------------------- Setup -------------------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; } // Wait for Serial
+
+  // Configure pins
+  pinMode(PIN_PUL, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+  pinMode(PIN_ENA, OUTPUT);
+  digitalWrite(PIN_PUL, LOW);
+  digitalWrite(PIN_DIR, LOW);
+  digitalWrite(PIN_ENA, motorEnabled ? LOW : HIGH); // Usually LOW = enable, but check driver doc
+
+  // Initialize HX711
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(hx711_calibration_factor);
+  scale.tare(); // Reset the scale to zero
+
+  // Initialize INA219
+  if (!ina219.begin()) {
+    Serial.println("INA219 not found!");
+    // Handle error if needed
+  } else {
+    // Optional: set INA219 calibration
+    // ina219.setCalibration_32V_2A();
+  }
+
+  Serial.println("System Initialized. Send an RPM value (100-1200) via Serial.");
+  Serial.println("CSV Format: MotorRPM, GearboxRPM, Force(N), Torque(Nm), InputPower(W), OutputPower(W), Efficiency(%)");
+}
+
+// ------------------------- Main Loop -------------------------
+void loop() {
+  // 1) Check for new user input (RPM)
+  if (Serial.available() > 0) {
+    int incomingRPM = Serial.parseInt();
+    if (incomingRPM >= 100 && incomingRPM <= 1200) {
+      motorRPM = incomingRPM;
+      newCommand = true;
+      // Clear the buffer
+      while (Serial.available() > 0) Serial.read();
+    }
+  }
+
+  // 2) If new command, update step timing
+  if (newCommand) {
+    // Recompute pulse delay based on new motorRPM
+    float stepFrequency = (motorRPM * STEPS_PER_REV * MICROSTEPPING) / 60.0;
+    if (stepFrequency < 1.0) stepFrequency = 1.0; // avoid divide-by-zero
+    pulseDelayMicros = (long)(1000000.0 / stepFrequency);
+
+    newCommand = false;
+  }
+
+  // 3) Measure load cell force
+  float loadCellReading_kg = scale.get_units(5); // average of 5 readings
+  // Convert kg -> Newtons
+  float forceN = loadCellReading_kg * GRAVITY;
+  
+  // 4) Compute output torque
+  // T_out = F * r
+  float torqueNm = forceN * ARM_RADIUS_METERS;
+
+  // 5) Measure input power from INA219
+  float busVoltage = ina219.getBusVoltage_V();        // Voltage at INA219 sense line
+  float shuntVoltage = ina219.getShuntVoltage_mV()/1000; 
+  float currentA = ina219.getCurrent_mA()/1000;       // Convert mA to A
+  float supplyVoltage = busVoltage + shuntVoltage;     // Approx. total supply voltage
+  float inputPowerW = supplyVoltage * currentA;        // P_in = V * I
+
+  // 6) Compute output power
+  // gearboxRPM = motorRPM / GEARBOX_RATIO
+  float gearboxRPM = motorRPM / GEARBOX_RATIO;
+  // omega_out (rad/s) = 2 * pi * (gearboxRPM / 60)
+  float omegaOut = 2.0f * PI * (gearboxRPM / 60.0f);
+  float outputPowerW = torqueNm * omegaOut;
+
+  // 7) Compute efficiency
+  float efficiencyPct = 0.0;
+  if (inputPowerW > 0.5) { // to avoid dividing by near-zero or noise
+    efficiencyPct = (outputPowerW / inputPowerW) * 100.0;
+  }
+
+  // 8) Print CSV data
+  // Format: MotorRPM, GearboxRPM, Force(N), Torque(Nm), InputPower(W), OutputPower(W), Efficiency(%)
+  Serial.print(motorRPM);        Serial.print(",");
+  Serial.print(gearboxRPM);      Serial.print(",");
+  Serial.print(forceN, 3);       Serial.print(",");
+  Serial.print(torqueNm, 3);     Serial.print(",");
+  Serial.print(inputPowerW, 3);  Serial.print(",");
+  Serial.print(outputPowerW, 3); Serial.print(",");
+  Serial.println(efficiencyPct, 3);
+
+  // 9) Step the motor at the desired speed (simple method)
+  // Toggle PUL pin to produce one step
+  digitalWrite(PIN_PUL, HIGH);
+  delayMicroseconds(pulseDelayMicros);
+  digitalWrite(PIN_PUL, LOW);
+  delayMicroseconds(pulseDelayMicros);
+
+  // *Note*: This simple approach continuously steps the motor at the set speed.
+  // If you need acceleration or more precise control, use AccelStepper or
+  // trapezoidal velocity profiles.
+}
